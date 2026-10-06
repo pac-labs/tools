@@ -3,7 +3,7 @@
 PACDIAG is a two-stage diagnostic workflow:
 
 1. `collect.sh` runs from a diagnostic container with the host filesystem mounted at `/host-root`.
-2. `report.py` accepts any number of copied PACDIAG bundles or older human-readable `scan.sh` outputs and generates an environment/readiness report.
+2. `report.py` accepts any number of copied PACDIAG bundles or older human-readable `scan.sh` outputs and generates both a hardware/utilization report and an environment/readiness report.
 
 The report separates **hardware capability** from **production validation**. Unknown physical topology or operational requirements remain `UNKNOWN`; they are never silently assumed to be healthy.
 
@@ -49,12 +49,17 @@ Paste all bundles, then send EOF:
 
 Outputs are written to `pacdiag-report/`:
 
+- `hardware-report.html`
+- `hardware-report.pdf`
+- `hardware-report.md`
 - `environment-report.html`
 - `environment-report.pdf`
 - `environment-report.md`
 - `environment-data.json`
 
-On Windows, `run-report.ps1` installs the small dependency and opens the generated HTML report.
+The hardware report focuses on per-server CPU/RAM, physical disks, filesystem usage, Kubernetes-local storage usage, physical NIC hardware, PCI/NUMA placement, link state/speed, bonding/VLAN relationships, default-route use, SR-IOV capability and cumulative RX/TX/error/drop counters.
+
+On Windows, `run-report.ps1` installs the small dependency and opens `hardware-report.pdf` after generating both PDFs.
 
 ## 2B. Generate from files/directories
 
@@ -70,9 +75,9 @@ Copy `.github/workflows/build-diagnostic-report.yml`, `report.py`, `requirements
 
 Paste bundles into a text file under `diagnostics/input/`, commit and push. The workflow:
 
-- generates HTML/PDF/Markdown/JSON;
-- uploads them as a workflow artifact;
-- commits the generated reports under `diagnostics/generated/` on push.
+- generates separate hardware and readiness HTML/PDF/Markdown reports plus JSON;
+- uploads both PDFs and the full report set as workflow artifacts;
+- leaves the generated files in the Actions workspace and publishes them as downloadable artifacts.
 
 Use a private repository unless the captured infrastructure information is safe to publish.
 

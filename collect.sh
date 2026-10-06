@@ -4,7 +4,7 @@
 # All progress and warnings go to stderr.
 set -u
 
-COLLECTOR_VERSION="1.0.0"
+COLLECTOR_VERSION="1.1.0"
 HOST_ROOT="${HOST_ROOT:-/host-root}"
 SCAN_URL="${SCAN_URL:-https://raw.githubusercontent.com/pac-labs/tools/refs/heads/main/scan.sh}"
 REDACT_NETWORK="${PACDIAG_REDACT_NETWORK:-0}"
@@ -107,7 +107,87 @@ if [ -d "$HOST_ROOT/sys/block" ]; then
         model="$(read1 "$p/device/model")"
         serial="$(read1 "$p/device/serial")"
         removable="$(read1 "$p/removable")"
-        row DISK "$n" "${sectors:-0}" "${rotational:-unknown}" "$model" "$serial" "${removable:-0}" >> "$MACHINE"
+        vendor="$(read1 "$p/device/vendor")"
+        revision="$(read1 "$p/device/rev")"
+        wwid="$(read1 "$p/device/wwid")"
+        [ -z "$wwid" ] && wwid="$(read1 "$p/wwid")"
+        devno="$(read1 "$p/dev")"
+        bus=""
+        if [ -e "$p/device/subsystem" ]; then
+            bus="$(basename "$(readlink -f "$p/device/subsystem" 2>/dev/null)")"
+        fi
+        case "$n" in nvme*) bus="nvme" ;; esac
+        logical_bs="$(read1 "$p/queue/logical_block_size")"
+        physical_bs="$(read1 "$p/queue/physical_block_size")"
+        row DISK "$n" "${sectors:-0}" "${rotational:-unknown}" "$model" "$serial" "${removable:-0}" \
+            "$vendor" "$revision" "$wwid" "$devno" "$bus" "$logical_bs" "$physical_bs" >> "$MACHINE"
+    done
+fi
+
+# Partition inventory helps relate physical disks to filesystems without lsblk.
+if [ -d "$HOST_ROOT/sys/class/block" ]; then
+    for p in "$HOST_ROOT"/sys/class/block/*; do
+        [ -r "$p/partition" ] || continue
+        n="$(basename "$p")"
+        parent="$(basename "$(dirname "$(readlink -f "$p" 2>/dev/null)")")"
+        size="$(read1 "$p/size")"
+        devno="$(read1 "$p/dev")"
+        row PART "$n" "$parent" "${size:-0}" "$devno" >> "$MACHINE"
+    done
+fi
+
+# Host filesystem usage. Pseudo filesystems and per-pod tmpfs/overlay mounts
+# are intentionally omitted; the goal is server/storage capacity.
+if [ -r "$HOST_ROOT/proc/1/mountinfo" ] && command -v df >/dev/null 2>&1; then
+    while IFS= read -r mi; do
+        set -- $mi
+        [ "$#" -ge 10 ] || continue
+        major_minor="$3"
+        mountpoint="$5"
+        shift 6
+        while [ "$#" -gt 0 ] && [ "$1" != "-" ]; do shift; done
+        [ "$#" -ge 3 ] || continue
+        shift
+        fstype="$1"
+        source="$2"
+
+        case "$fstype" in
+            ext2|ext3|ext4|xfs|btrfs|vfat|f2fs|zfs|ceph|nfs|nfs4)
+                ;;
+            overlay)
+                [ "$mountpoint" = "/" ] || continue
+                ;;
+            *)
+                continue
+                ;;
+        esac
+
+        host_path="$HOST_ROOT$mountpoint"
+        [ "$mountpoint" = "/" ] && host_path="$HOST_ROOT"
+        [ -e "$host_path" ] || continue
+
+        stats="$(df -P -k "$host_path" 2>/dev/null | awk 'NR==2 {print $2 "|" $3 "|" $4 "|" $5}')"
+        [ -n "$stats" ] || continue
+        total_kib="$(printf '%s' "$stats" | cut -d'|' -f1)"
+        used_kib="$(printf '%s' "$stats" | cut -d'|' -f2)"
+        avail_kib="$(printf '%s' "$stats" | cut -d'|' -f3)"
+        use_pct="$(printf '%s' "$stats" | cut -d'|' -f4 | tr -d '%')"
+        row MOUNT "$major_minor" "$mountpoint" "$fstype" "$source" \
+            "$total_kib" "$used_kib" "$avail_kib" "$use_pct" >> "$MACHINE"
+    done < "$HOST_ROOT/proc/1/mountinfo"
+fi
+
+# A few high-value Kubernetes directories. This is cumulative disk usage,
+# not a performance probe. Bound it when timeout(1) is available.
+if command -v du >/dev/null 2>&1; then
+    for d in /var/lib/kubelet /var/lib/containerd /var/lib/etcd; do
+        hp="$HOST_ROOT$d"
+        [ -d "$hp" ] || continue
+        kib=""
+        if command -v timeout >/dev/null 2>&1; then
+            kib="$(timeout 20 du -sk "$hp" 2>/dev/null | awk 'NR==1 {print $1}')"
+        fi
+        [ -n "$kib" ] && row DIRUSE "$d" "$kib" >> "$MACHINE"
     done
 fi
 
@@ -121,12 +201,15 @@ if [ -d "$NETROOT" ]; then
         speed="$(read1 "$p/speed")"
         duplex="$(read1 "$p/duplex")"
         mac="$(read1 "$p/address")"
+        carrier="$(read1 "$p/carrier")"
         driver=""
         vendor=""
         device=""
         numa=""
         sriov_total=""
         sriov_num=""
+        bus_addr=""
+        master=""
         if [ -e "$p/device" ]; then
             [ -L "$p/device/driver" ] && driver="$(basename "$(readlink "$p/device/driver" 2>/dev/null)")"
             vendor="$(read1 "$p/device/vendor")"
@@ -134,9 +217,21 @@ if [ -d "$NETROOT" ]; then
             numa="$(read1 "$p/device/numa_node")"
             sriov_total="$(read1 "$p/device/sriov_totalvfs")"
             sriov_num="$(read1 "$p/device/sriov_numvfs")"
+            bus_addr="$(basename "$(readlink -f "$p/device" 2>/dev/null)")"
         fi
+        [ -L "$p/master" ] && master="$(basename "$(readlink -f "$p/master" 2>/dev/null)")"
+        rx_bytes="$(read1 "$p/statistics/rx_bytes")"
+        tx_bytes="$(read1 "$p/statistics/tx_bytes")"
+        rx_packets="$(read1 "$p/statistics/rx_packets")"
+        tx_packets="$(read1 "$p/statistics/tx_packets")"
+        rx_errors="$(read1 "$p/statistics/rx_errors")"
+        tx_errors="$(read1 "$p/statistics/tx_errors")"
+        rx_dropped="$(read1 "$p/statistics/rx_dropped")"
+        tx_dropped="$(read1 "$p/statistics/tx_dropped")"
+        carrier_changes="$(read1 "$p/carrier_changes")"
         if [ "$REDACT_NETWORK" = "1" ]; then mac="redacted"; fi
-        row NET "$n" "$state" "$mac" "$mtu" "$speed" "$duplex" "$driver" "$vendor" "$device" "$numa" "$sriov_total" "$sriov_num" >> "$MACHINE"
+        row NET "$n" "$state" "$mac" "$mtu" "$speed" "$duplex" "$driver" "$vendor" "$device" "$numa" "$sriov_total" "$sriov_num" \
+            "$carrier" "$bus_addr" "$master" "$rx_bytes" "$tx_bytes" "$rx_packets" "$tx_packets" "$rx_errors" "$tx_errors" "$rx_dropped" "$tx_dropped" "$carrier_changes" >> "$MACHINE"
         if [ -d "$p/bonding" ]; then
             mode="$(read1 "$p/bonding/mode")"
             slaves="$(read1 "$p/bonding/slaves")"
@@ -145,6 +240,19 @@ if [ -d "$NETROOT" ]; then
             row BOND "$n" "$mode" "$slaves" "$lacp" "$hash" >> "$MACHINE"
         fi
     done
+fi
+
+# VLAN relationships are available from procfs even when ip(8) is absent.
+if [ -r "$HOST_ROOT/proc/net/vlan/config" ]; then
+    awk -F'|' 'NR > 2 {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1);
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3);
+        if ($1 != "" && $2 != "" && $3 != "") print $1 "\t" $2 "\t" $3
+    }' "$HOST_ROOT/proc/net/vlan/config" 2>/dev/null |
+    while IFS="$(printf '\t')" read -r vlan_name vlan_id vlan_parent; do
+        row VLAN "$vlan_name" "$vlan_id" "$vlan_parent"
+    done >> "$MACHINE"
 fi
 
 if [ -r "$HOST_ROOT/proc/net/route" ]; then
@@ -225,8 +333,8 @@ if command -v kubectl >/dev/null 2>&1 && kubectl --request-timeout=4s get --raw=
 
     # Rook/Ceph summaries when those CRDs are installed.
     kubectl --request-timeout=8s get cephcluster -A --no-headers \
-      -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,STATE:.status.state,HEALTH:.status.ceph.health,CURRENT:.status.ceph.version.version,TARGET:.spec.cephVersion.image' 2>/dev/null \
-      | while read -r ns name phase state health current target; do row CEPHCLUSTER "$ns" "$name" "$phase" "$state" "$health" "$current" "$target"; done >> "$K8S"
+      -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,STATE:.status.state,HEALTH:.status.ceph.health,CURRENT:.status.ceph.version.version,TARGET:.spec.cephVersion.image,TOTAL:.status.ceph.capacity.bytesTotal,USED:.status.ceph.capacity.bytesUsed,AVAILABLE:.status.ceph.capacity.bytesAvailable' 2>/dev/null \
+      | while read -r ns name phase state health current target total used available; do row CEPHCLUSTER "$ns" "$name" "$phase" "$state" "$health" "$current" "$target" "$total" "$used" "$available"; done >> "$K8S"
 
     for kind in cephblockpool cephfilesystem cephobjectstore; do
         kubectl --request-timeout=8s get "$kind" -A --no-headers \

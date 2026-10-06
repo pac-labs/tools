@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   build-report:
-    name: Generate environment PDF
+    name: Generate readiness + hardware PDFs
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -98,12 +98,13 @@ jobs:
           echo "readiness_exit_code=$rc" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Verify PDF was created
+      - name: Verify PDFs were created
         shell: bash
         run: |
           set -euo pipefail
           test -s diagnostics/generated/environment-report.pdf
-          ls -lh diagnostics/generated/environment-report.pdf
+          test -s diagnostics/generated/hardware-report.pdf
+          ls -lh diagnostics/generated/environment-report.pdf diagnostics/generated/hardware-report.pdf
 
       - name: Write workflow summary
         shell: bash
@@ -119,15 +120,22 @@ jobs:
               echo 'The report was generated successfully without a blocking readiness verdict.'
             fi
             echo
-            echo 'Download **environment-report.pdf** from the workflow artifacts below.'
+            echo 'Download **hardware-report.pdf** for the hardware/topology view and **environment-report.pdf** for Ceph/OpenStack readiness.'
             echo
             echo 'Additional machine-readable and HTML/Markdown outputs are included in the full report artifact.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload PDF
+      - name: Upload readiness PDF
         uses: actions/upload-artifact@v7
         with:
           path: diagnostics/generated/environment-report.pdf
+          archive: false
+          retention-days: 30
+
+      - name: Upload hardware PDF
+        uses: actions/upload-artifact@v7
+        with:
+          path: diagnostics/generated/hardware-report.pdf
           archive: false
           retention-days: 30
 
@@ -138,6 +146,8 @@ jobs:
           path: |
             diagnostics/generated/environment-report.html
             diagnostics/generated/environment-report.md
+            diagnostics/generated/hardware-report.html
+            diagnostics/generated/hardware-report.md
             diagnostics/generated/environment-data.json
           if-no-files-found: error
           retention-days: 30

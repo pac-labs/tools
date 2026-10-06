@@ -24,7 +24,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 BASELINE_DATE = "2026-10-06"
 FALLBACK_CURRENT = {
     "talos": "1.14.1",
@@ -72,6 +72,30 @@ def fmt_disk_gib(sectors: Any) -> str:
     return f"{nfloat(sectors) * 512 / 1024**3:.1f} GiB"
 
 
+def fmt_kib(kib: Any) -> str:
+    v = nfloat(kib)
+    if v >= 1024 * 1024:
+        return f"{v / 1024 / 1024:.1f} GiB"
+    if v >= 1024:
+        return f"{v / 1024:.1f} MiB"
+    return f"{v:.0f} KiB"
+
+
+def fmt_bytes(value: Any) -> str:
+    v = nfloat(value)
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    i = 0
+    while v >= 1024 and i < len(units) - 1:
+        v /= 1024
+        i += 1
+    return f"{v:.1f} {units[i]}" if i else f"{v:.0f} B"
+
+
+def pct(used: Any, total: Any) -> float:
+    t = nfloat(total)
+    return (nfloat(used) * 100.0 / t) if t > 0 else 0.0
+
+
 def safe(s: Any) -> str:
     return html.escape(str(s if s is not None else ""))
 
@@ -84,10 +108,62 @@ class Disk:
     model: str = ""
     serial: str = ""
     removable: str = "0"
+    vendor: str = ""
+    revision: str = ""
+    wwid: str = ""
+    devno: str = ""
+    bus: str = ""
+    logical_block_size: int = 0
+    physical_block_size: int = 0
 
     @property
     def gib(self) -> float:
         return self.sectors * 512 / 1024**3
+
+    @property
+    def media(self) -> str:
+        if self.rotational == "0":
+            return "SSD/NVMe"
+        if self.rotational == "1":
+            return "rotational"
+        return self.rotational or "unknown"
+
+
+@dataclasses.dataclass
+class Partition:
+    name: str
+    parent: str = ""
+    sectors: int = 0
+    devno: str = ""
+
+    @property
+    def gib(self) -> float:
+        return self.sectors * 512 / 1024**3
+
+
+@dataclasses.dataclass
+class MountUsage:
+    major_minor: str
+    mountpoint: str
+    fstype: str
+    source: str
+    total_kib: int = 0
+    used_kib: int = 0
+    avail_kib: int = 0
+    use_pct: int = 0
+
+
+@dataclasses.dataclass
+class DirUsage:
+    path: str
+    kib: int = 0
+
+
+@dataclasses.dataclass
+class Vlan:
+    name: str
+    vlan_id: str = ""
+    parent: str = ""
 
 
 @dataclasses.dataclass
@@ -104,6 +180,18 @@ class NetIf:
     numa: str = ""
     sriov_total: int = 0
     sriov_num: int = 0
+    carrier: str = ""
+    bus_addr: str = ""
+    master: str = ""
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+    rx_packets: int = 0
+    tx_packets: int = 0
+    rx_errors: int = 0
+    tx_errors: int = 0
+    rx_dropped: int = 0
+    tx_dropped: int = 0
+    carrier_changes: int = 0
 
     @property
     def physical(self) -> bool:
@@ -151,8 +239,12 @@ class Node:
     iommu: str = "unknown"
     iommu_groups: int = 0
     disks: list[Disk] = dataclasses.field(default_factory=list)
+    partitions: list[Partition] = dataclasses.field(default_factory=list)
+    mounts: list[MountUsage] = dataclasses.field(default_factory=list)
+    dir_usage: list[DirUsage] = dataclasses.field(default_factory=list)
     nets: list[NetIf] = dataclasses.field(default_factory=list)
     bonds: list[Bond] = dataclasses.field(default_factory=list)
+    vlans: list[Vlan] = dataclasses.field(default_factory=list)
     routes: list[list[str]] = dataclasses.field(default_factory=list)
     kubelet_state: str = ""
     etcd_data: str = ""
@@ -170,6 +262,35 @@ class Node:
     @property
     def physical_nics(self) -> list[NetIf]:
         return [n for n in self.nets if n.physical]
+
+    @property
+    def storage_gib(self) -> float:
+        return sum(d.gib for d in self.disks if d.removable != "1")
+
+    @property
+    def unique_mounts(self) -> list[MountUsage]:
+        # A filesystem can be visible at more than one mount point. Prefer one
+        # representative row per major:minor/source so totals are not doubled.
+        chosen: dict[str, MountUsage] = {}
+        for m in self.mounts:
+            key = m.major_minor if m.major_minor and m.major_minor != "0:0" else (m.source or m.mountpoint)
+            cur = chosen.get(key)
+            if cur is None or m.total_kib > cur.total_kib or (m.mountpoint == "/" and cur.mountpoint != "/"):
+                chosen[key] = m
+        return list(chosen.values())
+
+    @property
+    def mounted_total_kib(self) -> int:
+        return sum(m.total_kib for m in self.unique_mounts)
+
+    @property
+    def mounted_used_kib(self) -> int:
+        return sum(m.used_kib for m in self.unique_mounts)
+
+    @property
+    def default_route_ifaces(self) -> set[str]:
+        # /proc/net/route represents IPv4 values as little-endian hex.
+        return {r[0] for r in self.routes if len(r) >= 2 and r[1] == "00000000"}
 
     @property
     def osd_candidate_count(self) -> int:
@@ -312,15 +433,44 @@ def parse_bundle_payload(payload: bytes, env: Environment, source: str) -> None:
             elif key == "iommu": node.iommu = val
             elif key == "iommu_groups": node.iommu_groups = nint(val)
         elif typ == "DISK" and len(row) >= 7:
-            node.disks.append(Disk(row[1], nint(row[2]), row[3], row[4], row[5], row[6]))
+            node.disks.append(Disk(
+                row[1], nint(row[2]), row[3], row[4], row[5], row[6],
+                row[7] if len(row) > 7 else "",
+                row[8] if len(row) > 8 else "",
+                row[9] if len(row) > 9 else "",
+                row[10] if len(row) > 10 else "",
+                row[11] if len(row) > 11 else "",
+                nint(row[12]) if len(row) > 12 else 0,
+                nint(row[13]) if len(row) > 13 else 0,
+            ))
+        elif typ == "PART" and len(row) >= 5:
+            node.partitions.append(Partition(row[1], row[2], nint(row[3]), row[4]))
+        elif typ == "MOUNT" and len(row) >= 9:
+            node.mounts.append(MountUsage(row[1], row[2], row[3], row[4], nint(row[5]), nint(row[6]), nint(row[7]), nint(row[8])))
+        elif typ == "DIRUSE" and len(row) >= 3:
+            node.dir_usage.append(DirUsage(row[1], nint(row[2])))
         elif typ == "NET" and len(row) >= 13:
             node.nets.append(NetIf(
                 name=row[1], state=row[2], mac=row[3], mtu=nint(row[4]), speed_mbps=max(0, nint(row[5])),
                 duplex=row[6], driver=row[7], vendor=row[8], device=row[9], numa=row[10],
-                sriov_total=nint(row[11]), sriov_num=nint(row[12])
+                sriov_total=nint(row[11]), sriov_num=nint(row[12]),
+                carrier=row[13] if len(row) > 13 else "",
+                bus_addr=row[14] if len(row) > 14 else "",
+                master=row[15] if len(row) > 15 else "",
+                rx_bytes=nint(row[16]) if len(row) > 16 else 0,
+                tx_bytes=nint(row[17]) if len(row) > 17 else 0,
+                rx_packets=nint(row[18]) if len(row) > 18 else 0,
+                tx_packets=nint(row[19]) if len(row) > 19 else 0,
+                rx_errors=nint(row[20]) if len(row) > 20 else 0,
+                tx_errors=nint(row[21]) if len(row) > 21 else 0,
+                rx_dropped=nint(row[22]) if len(row) > 22 else 0,
+                tx_dropped=nint(row[23]) if len(row) > 23 else 0,
+                carrier_changes=nint(row[24]) if len(row) > 24 else 0,
             ))
         elif typ == "BOND" and len(row) >= 6:
             node.bonds.append(Bond(row[1], row[2], row[3], row[4], row[5]))
+        elif typ == "VLAN" and len(row) >= 4:
+            node.vlans.append(Vlan(row[1], row[2], row[3]))
         elif typ == "ROUTE4":
             node.routes.append(row[1:])
         elif typ == "K8SLOCAL" and len(row) >= 3:
@@ -340,7 +490,7 @@ def parse_bundle_payload(payload: bytes, env: Environment, source: str) -> None:
 def merge_node(dst: Node, src: Node) -> None:
     for f in dataclasses.fields(Node):
         name = f.name
-        if name in {"disks", "nets", "bonds", "routes"}:
+        if name in {"disks", "partitions", "mounts", "dir_usage", "nets", "bonds", "vlans", "routes"}:
             if not getattr(dst, name) and getattr(src, name):
                 setattr(dst, name, getattr(src, name))
         else:
@@ -370,7 +520,12 @@ def merge_k8s(c: ClusterView, text: str) -> None:
         elif typ == "CRD" and len(row) >= 2:
             c.crds.add(row[1])
         elif typ == "CEPHCLUSTER" and len(row) >= 8:
-            c.cephclusters[(row[1], row[2])] = {"phase": row[3], "state": row[4], "health": row[5], "current": row[6], "target": row[7]}
+            c.cephclusters[(row[1], row[2])] = {
+                "phase": row[3], "state": row[4], "health": row[5], "current": row[6], "target": row[7],
+                "bytes_total": row[8] if len(row) > 8 else "",
+                "bytes_used": row[9] if len(row) > 9 else "",
+                "bytes_available": row[10] if len(row) > 10 else "",
+            }
         elif typ == "CEPHRESOURCE" and len(row) >= 4:
             c.cephresources.add((row[1], row[2], row[3]))
 
@@ -425,6 +580,22 @@ def parse_legacy_scan(text: str, source: str) -> Node:
         slaves = bm(r"/bonding/slaves:([^\n]+)")
         if mode or slaves:
             node.bonds.append(Bond(name, mode, slaves))
+
+    # Infer conventional VLAN names from legacy interface blocks.
+    known_ifaces = {x.name for x in node.nets}
+    for x in node.nets:
+        if "." in x.name:
+            parent, suffix = x.name.rsplit(".", 1)
+            if parent in known_ifaces and suffix.isdigit():
+                node.vlans.append(Vlan(x.name, suffix, parent))
+
+    # Legacy raw /proc/net/route table, when present.
+    routes = re.search(r"HOST ROUTES\s*\n=+\s*\n(.*?)(?:\n\s*=+\s*\nDEFAULT ROUTE|\Z)", text, re.S)
+    if routes:
+        for line in routes.group(1).splitlines():
+            mm = re.match(r"^\s*(\S+)\s+([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{8})\s+\S+\s+\S+\s+\S+\s+(\d+)\s+([0-9A-Fa-f]{8})\b", line)
+            if mm:
+                node.routes.append([mm.group(1), mm.group(2).upper(), mm.group(3).upper(), mm.group(4), mm.group(5).upper()])
 
     # Newer scan additions, if present.
     hv = m(r"^Hardware virtualization:\s+(.+)$", re.M)
@@ -976,6 +1147,444 @@ def render_pdf(path: Path, env: Environment, components: dict[str, list[str]], d
     return True
 
 
+
+PCI_VENDOR_NAMES = {
+    "0x8086": "Intel",
+    "0x14e4": "Broadcom",
+    "0x15b3": "NVIDIA/Mellanox",
+    "0x1af4": "Virtio",
+    "0x1077": "QLogic/Marvell",
+    "0x19a2": "Emulex/Broadcom",
+}
+PCI_DEVICE_NAMES = {
+    ("0x14e4", "0x1657"): "NetXtreme BCM5719 Gigabit Ethernet",
+    ("0x14e4", "0x168e"): "NetXtreme II BCM57810 10 Gigabit Ethernet",
+    ("0x8086", "0x10fb"): "82599 / X520 10 Gigabit Ethernet",
+}
+
+
+def route_hex_ipv4(value: str) -> str:
+    try:
+        raw = bytes.fromhex(value)
+        if len(raw) != 4:
+            return value
+        return ".".join(str(x) for x in raw[::-1])
+    except Exception:
+        return value
+
+
+def nic_hardware_name(nic: NetIf) -> str:
+    specific = PCI_DEVICE_NAMES.get((nic.vendor.lower(), nic.device.lower()))
+    if specific:
+        return specific
+    vendor = PCI_VENDOR_NAMES.get(nic.vendor.lower(), nic.vendor or "")
+    if vendor and nic.device:
+        return f"{vendor} PCI {nic.device}"
+    return vendor or nic.driver or "unknown"
+
+
+def interface_usage(node: Node, nic: NetIf) -> str:
+    bits: list[str] = []
+    if nic.master:
+        bits.append(f"member of {nic.master}")
+    else:
+        # Older bundles did not capture the sysfs master symlink, but bond
+        # membership was still present in the bond's slave list.
+        for b in node.bonds:
+            if nic.name in (b.slaves or "").split():
+                bits.append(f"member of {b.name}")
+                break
+    if nic.name in node.default_route_ifaces:
+        bits.append("default IPv4 route")
+    children = [v for v in node.vlans if v.parent == nic.name]
+    if children:
+        bits.append("parent of VLAN " + ", ".join(v.vlan_id for v in children))
+    if not bits:
+        if nic.state == "up":
+            bits.append("active standalone")
+        elif nic.state == "down":
+            bits.append("down / no active role observed")
+        else:
+            bits.append(nic.state or "role not established")
+    return "; ".join(bits)
+
+
+def bond_usage(node: Node, bond: Bond) -> str:
+    bits = []
+    children = [v for v in node.vlans if v.parent == bond.name]
+    if children:
+        bits.append("VLANs " + ", ".join(v.vlan_id for v in children))
+    if bond.name in node.default_route_ifaces:
+        bits.append("default IPv4 route")
+    return "; ".join(bits) or "aggregate link"
+
+
+def backing_device(node: Node, mount: MountUsage) -> str:
+    for d in node.disks:
+        if d.devno and d.devno == mount.major_minor:
+            return d.name
+    for p in node.partitions:
+        if p.devno and p.devno == mount.major_minor:
+            return f"{p.name} -> {p.parent}"
+    src = (mount.source or "").rsplit("/", 1)[-1]
+    if src:
+        for p in node.partitions:
+            if p.name == src:
+                return f"{p.name} -> {p.parent}"
+        for d in node.disks:
+            if d.name == src:
+                return d.name
+    return mount.major_minor or "unknown"
+
+
+def node_storage_summary(node: Node) -> str:
+    cap = node.storage_gib
+    if node.mounted_total_kib:
+        used = node.mounted_used_kib / 1024 / 1024
+        total = node.mounted_total_kib / 1024 / 1024
+        return f"{cap:.1f} GiB block capacity; {used:.1f}/{total:.1f} GiB used across observed mounted filesystems ({pct(node.mounted_used_kib, node.mounted_total_kib):.1f}%)"
+    return f"{cap:.1f} GiB block capacity; mounted filesystem usage was not captured"
+
+
+def ceph_capacity_rows(env: Environment) -> list[tuple[str, str, int, int, int, str]]:
+    out = []
+    for (ns, name), c in env.cluster.cephclusters.items():
+        total = nint(c.get("bytes_total"))
+        used = nint(c.get("bytes_used"))
+        avail = nint(c.get("bytes_available"))
+        out.append((ns, name, total, used, avail, c.get("health", "")))
+    return out
+
+
+def render_hardware_markdown(env: Environment, components: dict[str, list[str]]) -> str:
+    total_cpu = sum(n.logical_cpus for n in env.nodes)
+    total_ram = sum(n.mem_gib for n in env.nodes)
+    total_storage = sum(n.storage_gib for n in env.nodes)
+    active_nics = sum(1 for n in env.nodes for x in n.physical_nics if x.state == "up")
+    lines = [
+        "# PACDIAG Hardware & Utilization Report", "",
+        f"Generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", "",
+        "This report focuses on observed server hardware, storage use and network topology. It is intentionally separate from the Ceph/OpenStack production-readiness assessment.", "",
+        "## Environment summary", "",
+        f"- Scanned servers: **{len(env.nodes)}**",
+        f"- Logical CPUs: **{total_cpu}**",
+        f"- Installed RAM: **{total_ram:.1f} GiB**",
+        f"- Physical block capacity observed: **{total_storage:.1f} GiB**",
+        f"- Active physical NICs: **{active_nics}**",
+        f"- Detected CNI: **{', '.join(components['cni']) or 'not identified'}**",
+        f"- Detected Ceph/Rook: **{', '.join(components['ceph']) or 'not detected'}**",
+        f"- Detected OpenStack: **{', '.join(components['openstack']) or 'not detected'}**", "",
+        "> NIC RX/TX counters are cumulative since interface/host startup; they are not instantaneous throughput. Filesystem use is a point-in-time capacity snapshot.", "",
+    ]
+    cephcaps = ceph_capacity_rows(env)
+    if cephcaps:
+        lines += ["## Ceph capacity reported by Kubernetes", "", "| Namespace | Cluster | Health | Total | Used | Available | Use |", "|---|---|---|---:|---:|---:|---:|"]
+        for ns, name, total, used, avail, health in cephcaps:
+            lines.append(f"| {ns} | {name} | {health or 'unknown'} | {fmt_bytes(total)} | {fmt_bytes(used)} | {fmt_bytes(avail)} | {pct(used,total):.1f}% |")
+        lines.append("")
+    for n in env.nodes:
+        lines += [f"## {n.name}", "", f"- System: {n.manufacturer} {n.model} ({node_role(env,n)})", f"- CPU: {n.cpu_model}; {n.physical_cores or '?'} physical / {n.logical_cpus} logical; {n.sockets or '?'} socket(s)", f"- RAM: {n.mem_gib:.1f} GiB total, {n.mem_available_kib/1024/1024:.1f} GiB available", f"- Storage: {node_storage_summary(n)}", ""]
+        lines += ["### Physical storage", "", "| Device | Size | Media | Vendor / model | Bus | Serial |", "|---|---:|---|---|---|---|"]
+        if n.disks:
+            for d in n.disks:
+                lines.append(f"| {d.name} | {d.gib:.1f} GiB | {d.media} | {(d.vendor + ' ' + d.model).strip() or 'unknown'} | {d.bus or 'unknown'} | {d.serial or 'unknown'} |")
+        else:
+            lines.append("| - | - | - | No physical disks captured | - | - |")
+        lines += ["", "### Filesystem / storage use", "", "| Mount | Source | Backing device | FS | Capacity | Used | Free | Use |", "|---|---|---|---|---:|---:|---:|---:|"]
+        if n.mounts:
+            for m in n.mounts:
+                lines.append(f"| {m.mountpoint} | {m.source} | {backing_device(n,m)} | {m.fstype} | {fmt_kib(m.total_kib)} | {fmt_kib(m.used_kib)} | {fmt_kib(m.avail_kib)} | {m.use_pct}% |")
+        else:
+            lines.append("| - | - | - | - | - | - | - | Usage not captured; rerun current collector |")
+        if n.dir_usage:
+            lines += ["", "Kubernetes-local directory usage:"]
+            for d in n.dir_usage:
+                lines.append(f"- `{d.path}`: {fmt_kib(d.kib)}")
+        lines += ["", "### Physical network cards", "", "| Interface | Hardware | PCI / NUMA | Link | Use | SR-IOV | RX / TX | Errors / drops |", "|---|---|---|---|---|---|---|---|"]
+        phys = n.physical_nics
+        if phys:
+            for x in phys:
+                pci = x.bus_addr or "?"
+                if x.numa not in ("", "-1"):
+                    pci += f" / NUMA {x.numa}"
+                link = f"{x.speed_mbps/1000:g} Gb/s {x.duplex or ''}".strip() if x.speed_mbps else (x.state or "unknown")
+                sriov = f"{x.sriov_num}/{x.sriov_total} VFs" if x.sriov_total else "none observed"
+                counters = f"{fmt_bytes(x.rx_bytes)} / {fmt_bytes(x.tx_bytes)}"
+                errs = f"{x.rx_errors + x.tx_errors} errors / {x.rx_dropped + x.tx_dropped} drops"
+                lines.append(f"| {x.name} | {nic_hardware_name(x)} ({x.driver or 'no driver'}) | {pci} | {link}, MTU {x.mtu}, {x.state} | {interface_usage(n,x)} | {sriov} | {counters} | {errs} |")
+        else:
+            lines.append("| - | No physical NICs captured | - | - | - | - | - | - |")
+        if n.bonds or n.vlans:
+            lines += ["", "### Network aggregation / VLANs", ""]
+            for b in n.bonds:
+                lines.append(f"- **{b.name}**: mode `{b.mode or 'unknown'}`, members `{b.slaves or 'unknown'}`, {bond_usage(n,b)}")
+            for v in n.vlans:
+                lines.append(f"- **{v.name}**: VLAN {v.vlan_id} on `{v.parent}`")
+        if n.default_route_ifaces:
+            defaults = []
+            for rr in n.routes:
+                if len(rr) >= 4 and rr[1] == "00000000":
+                    defaults.append(f"{rr[0]} via {route_hex_ipv4(rr[2])} (metric {rr[3]})")
+            lines += ["", "Default IPv4 route(s): " + (", ".join(defaults) if defaults else ", ".join(sorted(n.default_route_ifaces)))]
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def render_hardware_html(env: Environment, components: dict[str, list[str]]) -> str:
+    generated = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    total_cpu = sum(n.logical_cpus for n in env.nodes)
+    total_ram = sum(n.mem_gib for n in env.nodes)
+    total_storage = sum(n.storage_gib for n in env.nodes)
+    used_kib = sum(n.mounted_used_kib for n in env.nodes)
+    mounted_kib = sum(n.mounted_total_kib for n in env.nodes)
+    active_nics = sum(1 for n in env.nodes for x in n.physical_nics if x.state == "up")
+    down_nics = sum(1 for n in env.nodes for x in n.physical_nics if x.state == "down")
+
+    node_sections = []
+    for n in env.nodes:
+        disk_rows = "".join(
+            f"<tr><td>{safe(d.name)}</td><td>{d.gib:.1f} GiB</td><td>{safe(d.media)}</td><td>{safe((d.vendor+' '+d.model).strip() or 'unknown')}</td><td>{safe(d.bus or 'unknown')}</td><td>{safe(d.serial or 'unknown')}</td><td>{safe(d.wwid or '—')}</td></tr>"
+            for d in n.disks
+        ) or "<tr><td colspan='7'>No physical disks captured.</td></tr>"
+        mount_rows = "".join(
+            f"<tr><td>{safe(m.mountpoint)}</td><td>{safe(m.source)}</td><td>{safe(backing_device(n,m))}</td><td>{safe(m.fstype)}</td><td>{safe(fmt_kib(m.total_kib))}</td><td>{safe(fmt_kib(m.used_kib))}</td><td>{safe(fmt_kib(m.avail_kib))}</td><td>{m.use_pct}%</td></tr>"
+            for m in n.mounts
+        ) or "<tr><td colspan='8'>Filesystem usage was not captured. Rerun the current collector to add it.</td></tr>"
+        dir_rows = "".join(f"<tr><td>{safe(d.path)}</td><td>{safe(fmt_kib(d.kib))}</td></tr>" for d in n.dir_usage)
+        net_rows = []
+        for x in n.physical_nics:
+            link = f"{x.speed_mbps/1000:g} Gb/s {x.duplex}".strip() if x.speed_mbps else (x.state or "unknown")
+            pci = x.bus_addr or "unknown"
+            if x.numa not in ("", "-1"):
+                pci += f" / NUMA {x.numa}"
+            sriov = f"{x.sriov_num}/{x.sriov_total}" if x.sriov_total else "—"
+            err = x.rx_errors + x.tx_errors
+            drop = x.rx_dropped + x.tx_dropped
+            net_rows.append(
+                f"<tr><td><b>{safe(x.name)}</b><div class='tiny'>{safe(x.mac)}</div></td><td>{safe(nic_hardware_name(x))}<div class='tiny'>driver {safe(x.driver or 'unknown')} · PCI {safe(x.vendor)}:{safe(x.device)}</div></td><td>{safe(pci)}</td><td>{safe(link)}<div class='tiny'>state {safe(x.state)} · carrier {safe(x.carrier or '?')} · MTU {x.mtu}</div></td><td>{safe(interface_usage(n,x))}</td><td>{safe(sriov)}</td><td>{safe(fmt_bytes(x.rx_bytes))}<br>{safe(fmt_bytes(x.tx_bytes))}</td><td>{err} / {drop}</td></tr>"
+            )
+        net_table = "".join(net_rows) or "<tr><td colspan='8'>No physical NICs captured.</td></tr>"
+        topo = []
+        for b in n.bonds:
+            topo.append(f"<li><b>{safe(b.name)}</b> - mode {safe(b.mode or 'unknown')}; members {safe(b.slaves or 'unknown')}; {safe(bond_usage(n,b))}</li>")
+        for v in n.vlans:
+            topo.append(f"<li><b>{safe(v.name)}</b> - VLAN {safe(v.vlan_id)} on {safe(v.parent)}</li>")
+        defaults = []
+        for rr in n.routes:
+            if len(rr) >= 4 and rr[1] == "00000000":
+                defaults.append(f"{rr[0]} via {route_hex_ipv4(rr[2])} (metric {rr[3]})")
+        if defaults:
+            topo.append("<li><b>Default IPv4:</b> " + safe(", ".join(defaults)) + "</li>")
+        topology = "<ul>" + "".join(topo) + "</ul>" if topo else "<div class='muted'>No bond/VLAN/default-route relationship was captured.</div>"
+
+        node_sections.append(f"""
+<section class='node'>
+<h2>{safe(n.name)}</h2>
+<div class='meta'>{safe(n.manufacturer)} {safe(n.model)} · {safe(node_role(env,n))} · Talos {safe(n.talos_version or 'unknown')} · kernel {safe(n.kernel or 'unknown')}</div>
+<div class='cards'>
+  <div class='card'><span>CPU</span><b>{n.logical_cpus} logical</b><small>{safe(n.cpu_model)} · {n.physical_cores or '?'} physical · {n.sockets or '?'} socket(s)</small></div>
+  <div class='card'><span>Memory</span><b>{n.mem_gib:.1f} GiB</b><small>{n.mem_available_kib/1024/1024:.1f} GiB available at scan time</small></div>
+  <div class='card'><span>Storage</span><b>{n.storage_gib:.1f} GiB</b><small>{safe(node_storage_summary(n))}</small></div>
+  <div class='card'><span>Networking</span><b>{len(n.physical_nics)} physical NICs</b><small>{sum(1 for x in n.physical_nics if x.state=='up')} up · {len(n.bonds)} bond(s) · {len(n.vlans)} VLAN(s)</small></div>
+</div>
+<h3>Physical storage</h3>
+<table><thead><tr><th>Device</th><th>Size</th><th>Media</th><th>Vendor / model</th><th>Bus</th><th>Serial</th><th>WWID</th></tr></thead><tbody>{disk_rows}</tbody></table>
+<h3>Filesystem / storage use</h3>
+<table><thead><tr><th>Mount</th><th>Source</th><th>Backing</th><th>FS</th><th>Capacity</th><th>Used</th><th>Free</th><th>Use</th></tr></thead><tbody>{mount_rows}</tbody></table>
+{("<h4>Kubernetes-local directory use</h4><table><thead><tr><th>Directory</th><th>Observed size</th></tr></thead><tbody>"+dir_rows+"</tbody></table>") if dir_rows else ""}
+<h3>Physical network cards and use</h3>
+<table class='wide'><thead><tr><th>Port</th><th>Adapter</th><th>PCI / NUMA</th><th>Link</th><th>Observed role</th><th>SR-IOV VFs</th><th>RX / TX</th><th>Err / drop</th></tr></thead><tbody>{net_table}</tbody></table>
+<h3>Network topology</h3>
+{topology}
+</section>""")
+
+    observed_storage = f"{fmt_kib(mounted_kib)} observed filesystems, {fmt_kib(used_kib)} used ({pct(used_kib,mounted_kib):.1f}%)" if mounted_kib else "filesystem use not captured"
+    cephcaps = ceph_capacity_rows(env)
+    ceph_capacity_html = ""
+    if cephcaps:
+        rows = "".join(
+            f"<tr><td>{safe(ns)}</td><td>{safe(name)}</td><td>{safe(health or 'unknown')}</td><td>{safe(fmt_bytes(total))}</td><td>{safe(fmt_bytes(used))}</td><td>{safe(fmt_bytes(avail))}</td><td>{pct(used,total):.1f}%</td></tr>"
+            for ns, name, total, used, avail, health in cephcaps
+        )
+        ceph_capacity_html = f"<h2>Ceph capacity reported by Kubernetes</h2><table><thead><tr><th>Namespace</th><th>Cluster</th><th>Health</th><th>Total</th><th>Used</th><th>Available</th><th>Use</th></tr></thead><tbody>{rows}</tbody></table>"
+    return f"""<!doctype html>
+<html><head><meta charset='utf-8'><title>PACDIAG Hardware Report</title>
+<style>
+@page {{ size:A4; margin:11mm; }}
+:root{{--ink:#17212b;--muted:#65717d;--line:#d5dce3;--bg:#f4f6f8;--accent:#245a7a}}
+*{{box-sizing:border-box}} body{{font-family:Inter,Segoe UI,Arial,sans-serif;color:var(--ink);margin:0;font-size:13px;line-height:1.35}} main{{max-width:1220px;margin:auto;padding:26px}} h1{{margin:0 0 4px;font-size:28px}} h2{{margin:30px 0 5px;border-bottom:1px solid var(--line);padding-bottom:5px}} h3{{margin:18px 0 6px}} h4{{margin:14px 0 5px}} .meta,.muted,.tiny{{color:var(--muted)}} .tiny{{font-size:10px}} .intro{{background:var(--bg);border-left:5px solid var(--accent);padding:14px 16px;margin:16px 0}} .summary,.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}} .card{{border:1px solid var(--line);border-radius:7px;padding:11px;min-width:0}} .card span{{display:block;color:var(--muted);font-size:11px}} .card b{{display:block;font-size:19px;margin:2px 0}} .card small{{display:block;color:var(--muted)}} table{{width:100%;border-collapse:collapse;margin:7px 0 15px;font-size:11px}} th,td{{border:1px solid var(--line);padding:6px;vertical-align:top;text-align:left;overflow-wrap:anywhere}} th{{background:var(--bg)}} ul{{margin-top:6px}} .node{{break-before:auto}} @media print{{main{{padding:0}} h2,h3{{break-after:avoid}} table{{font-size:8.5px}} .card{{break-inside:avoid}}}}
+</style></head><body><main>
+<h1>PACDIAG Hardware & Utilization Report</h1>
+<div class='meta'>Generated {safe(generated)} · PACDIAG reporter {TOOL_VERSION} · {len(env.nodes)} scanned server(s)</div>
+<div class='intro'><b>Scope:</b> physical server inventory, storage capacity/use and network topology/use. This report does not score production readiness. RX/TX values are cumulative counters since interface/host startup, not current throughput; filesystem use is a point-in-time snapshot.</div>
+<div class='summary'>
+  <div class='card'><span>Servers</span><b>{len(env.nodes)}</b><small>{total_cpu} logical CPUs total</small></div>
+  <div class='card'><span>Installed RAM</span><b>{total_ram:.1f} GiB</b><small>across all scanned nodes</small></div>
+  <div class='card'><span>Physical block capacity</span><b>{total_storage:.1f} GiB</b><small>{safe(observed_storage)}</small></div>
+  <div class='card'><span>Physical NICs</span><b>{active_nics} up / {down_nics} down</b><small>Ceph/Rook: {safe(', '.join(components['ceph']) or 'not detected')} · OpenStack: {safe(', '.join(components['openstack']) or 'not detected')}</small></div>
+</div>
+{ceph_capacity_html}
+{''.join(node_sections)}
+<h2>Interpretation notes</h2>
+<ul>
+<li>Block-device capacity and mounted-filesystem utilization are separate. An unmounted/raw Ceph OSD device can correctly show capacity with no filesystem usage.</li>
+<li>Network byte/packet counters are cumulative and help show which ports have actually carried traffic; they do not measure present bandwidth demand.</li>
+<li>A bond can provide aggregate capacity/redundancy while a single flow may remain limited to one member link depending on hashing.</li>
+<li>Older PACDIAG bundles remain readable, but new utilization/topology fields will say “not captured” until the current collector is rerun.</li>
+</ul>
+</main></body></html>"""
+
+
+def render_hardware_pdf(path: Path, env: Environment, components: dict[str, list[str]]) -> bool:
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    except Exception:
+        return False
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="HWsmall", parent=styles["BodyText"], fontSize=8.1, leading=10))
+    styles.add(ParagraphStyle(name="HWtiny", parent=styles["BodyText"], fontSize=6.7, leading=8))
+    doc = SimpleDocTemplate(str(path), pagesize=landscape(A4), rightMargin=9*mm, leftMargin=9*mm, topMargin=10*mm, bottomMargin=10*mm, title="PACDIAG Hardware and Utilization Report")
+    story = []
+    total_cpu = sum(n.logical_cpus for n in env.nodes)
+    total_ram = sum(n.mem_gib for n in env.nodes)
+    total_storage = sum(n.storage_gib for n in env.nodes)
+    used_kib = sum(n.mounted_used_kib for n in env.nodes)
+    mounted_kib = sum(n.mounted_total_kib for n in env.nodes)
+    story += [
+        Paragraph("PACDIAG Hardware & Utilization Report", styles["Title"]),
+        Paragraph(f"Generated {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} - PACDIAG reporter {TOOL_VERSION}", styles["HWsmall"]),
+        Spacer(1, 3*mm),
+        Paragraph("This document focuses on physical server inventory, network topology/counters and storage capacity/use. It intentionally does not score production readiness. Network RX/TX is cumulative since startup; filesystem usage is a point-in-time snapshot.", styles["HWsmall"]),
+        Spacer(1, 4*mm),
+    ]
+    summary = [
+        ["Servers", "Logical CPUs", "Installed RAM", "Physical storage", "Observed mounted filesystems"],
+        [str(len(env.nodes)), str(total_cpu), f"{total_ram:.1f} GiB", f"{total_storage:.1f} GiB", (f"{fmt_kib(used_kib)} / {fmt_kib(mounted_kib)} used ({pct(used_kib,mounted_kib):.1f}%)" if mounted_kib else "not captured")],
+    ]
+    st = Table(summary, colWidths=[28*mm,34*mm,42*mm,42*mm,90*mm])
+    st.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9eef2")),("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#cfd6dd")),("FONTSIZE",(0,0),(-1,-1),8),("PADDING",(0,0),(-1,-1),5)]))
+    story += [st, Spacer(1, 5*mm)]
+
+    cephcaps = ceph_capacity_rows(env)
+    if cephcaps:
+        cc = [["Ceph namespace","Cluster","Health","Total","Used","Available","Use"]]
+        for ns, name, total, used, avail, health in cephcaps:
+            cc.append([ns, name, health or "unknown", fmt_bytes(total), fmt_bytes(used), fmt_bytes(avail), f"{pct(used,total):.1f}%"])
+        cct = Table(cc, repeatRows=1, colWidths=[34*mm,42*mm,32*mm,35*mm,35*mm,35*mm,24*mm])
+        cct.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9eef2")),("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#cfd6dd")),("FONTSIZE",(0,0),(-1,-1),7.2),("PADDING",(0,0),(-1,-1),4)]))
+        story += [Paragraph("Ceph capacity reported by Kubernetes", styles["Heading2"]), cct, Spacer(1, 4*mm)]
+
+    def mk_table(data, widths, font=6.7):
+        # Convert long cells to Paragraph so wrapping works predictably.
+        cooked = []
+        for ridx,row in enumerate(data):
+            if ridx == 0:
+                cooked.append(row)
+            else:
+                cooked.append([Paragraph(safe(x), styles["HWtiny"]) if isinstance(x,str) else x for x in row])
+        t = Table(cooked, repeatRows=1, colWidths=widths)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#e9eef2")),
+            ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#cfd6dd")),
+            ("FONTSIZE",(0,0),(-1,-1),font),
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("PADDING",(0,0),(-1,-1),3),
+        ]))
+        return t
+
+    for idx,n in enumerate(env.nodes):
+        if idx:
+            story.append(PageBreak())
+        story += [
+            Paragraph(n.name, styles["Heading1"]),
+            Paragraph(f"{n.manufacturer} {n.model} - {node_role(env,n)} - Talos {n.talos_version or 'unknown'} - kernel {n.kernel or 'unknown'}", styles["HWsmall"]),
+            Paragraph(f"CPU: {n.cpu_model}; {n.physical_cores or '?'} physical / {n.logical_cpus} logical across {n.sockets or '?'} socket(s). Memory: {n.mem_gib:.1f} GiB total, {n.mem_available_kib/1024/1024:.1f} GiB available.", styles["HWsmall"]),
+            Spacer(1, 3*mm),
+            Paragraph("Physical storage", styles["Heading2"]),
+        ]
+        disks = [["Device","Size","Media","Vendor / model","Bus","Serial","WWID"]]
+        for d in n.disks:
+            disks.append([d.name, f"{d.gib:.1f} GiB", d.media, (d.vendor+" "+d.model).strip() or "unknown", d.bus or "unknown", d.serial or "unknown", d.wwid or "—"])
+        if len(disks)==1:
+            disks.append(["—","—","—","No physical disks captured","—","—","—"])
+        story += [mk_table(disks,[18*mm,22*mm,22*mm,70*mm,20*mm,45*mm,62*mm]), Spacer(1,2*mm)]
+
+        story += [Paragraph("Filesystem / storage use", styles["Heading2"])]
+        mounts = [["Mount","Source","Backing","FS","Capacity","Used","Free","Use"]]
+        for m in n.mounts:
+            mounts.append([m.mountpoint,m.source,backing_device(n,m),m.fstype,fmt_kib(m.total_kib),fmt_kib(m.used_kib),fmt_kib(m.avail_kib),f"{m.use_pct}%"])
+        if len(mounts)==1:
+            mounts.append(["—","—","—","—","—","—","—","Not captured - rerun current collector"])
+        story += [mk_table(mounts,[44*mm,54*mm,35*mm,21*mm,25*mm,25*mm,25*mm,25*mm]), Spacer(1,2*mm)]
+        if n.dir_usage:
+            dus = [["Kubernetes-local directory","Observed size"]] + [[d.path,fmt_kib(d.kib)] for d in n.dir_usage]
+            story += [mk_table(dus,[90*mm,40*mm]), Spacer(1,3*mm)]
+
+        story += [Paragraph("Physical network cards and observed use", styles["Heading2"])]
+        nets = [["Port","Adapter / driver","PCI / NUMA","Link","Observed role","SR-IOV","RX / TX","Errors / drops"]]
+        for x in n.physical_nics:
+            pci = x.bus_addr or "unknown"
+            if x.numa not in ("","-1"):
+                pci += f" / N{x.numa}"
+            link = f"{x.speed_mbps/1000:g}G {x.duplex}".strip() if x.speed_mbps else (x.state or "unknown")
+            link += f"; MTU {x.mtu}; {x.state}; carrier {x.carrier or '?'}"
+            sriov = f"{x.sriov_num}/{x.sriov_total} VFs" if x.sriov_total else "—"
+            nets.append([
+                x.name,
+                f"{nic_hardware_name(x)} / {x.driver or 'unknown'}",
+                pci,
+                link,
+                interface_usage(n,x),
+                sriov,
+                f"{fmt_bytes(x.rx_bytes)} / {fmt_bytes(x.tx_bytes)}",
+                f"{x.rx_errors+x.tx_errors} err / {x.rx_dropped+x.tx_dropped} drop",
+            ])
+        if len(nets)==1:
+            nets.append(["—","No physical NICs captured","—","—","—","—","—","—"])
+        story += [mk_table(nets,[18*mm,55*mm,28*mm,43*mm,48*mm,25*mm,36*mm,32*mm]), Spacer(1,2*mm)]
+
+        topo = []
+        for b in n.bonds:
+            topo.append(f"<b>{safe(b.name)}</b>: mode {safe(b.mode or 'unknown')}; members {safe(b.slaves or 'unknown')}; {safe(bond_usage(n,b))}")
+        for v in n.vlans:
+            topo.append(f"<b>{safe(v.name)}</b>: VLAN {safe(v.vlan_id)} on {safe(v.parent)}")
+        defaults=[]
+        for rr in n.routes:
+            if len(rr)>=4 and rr[1]=="00000000":
+                defaults.append(f"{rr[0]} via {route_hex_ipv4(rr[2])} metric {rr[3]}")
+        if defaults:
+            topo.append("<b>Default IPv4:</b> " + safe(", ".join(defaults)))
+        if topo:
+            story += [Paragraph("Network topology", styles["Heading2"])]
+            for t in topo:
+                story.append(Paragraph("• "+t, styles["HWsmall"]))
+
+    story += [Spacer(1, 4*mm), Paragraph("Interpretation notes", styles["Heading2"])]
+    for note in [
+        "Block-device capacity and mounted-filesystem utilization are separate. Raw/unmounted Ceph OSD devices can correctly have capacity with no filesystem usage.",
+        "RX/TX bytes and error/drop counters are cumulative and indicate observed use/health since startup; they do not measure current throughput or saturation.",
+        "Bonded capacity is aggregate. Individual flows may remain limited to one member link depending on bond mode and hash policy.",
+        "Older PACDIAG bundles remain readable. Newly-added utilization/topology fields are shown as not captured until those nodes are rescanned.",
+    ]:
+        story.append(Paragraph("• "+note, styles["HWsmall"]))
+
+    def page_num(canvas, docobj):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7)
+        canvas.setFillColor(colors.grey)
+        canvas.drawRightString(landscape(A4)[0]-9*mm, 6*mm, f"PACDIAG hardware - page {docobj.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=page_num, onLaterPages=page_num)
+    return True
+
+
+
 def as_jsonable(env: Environment, components: dict[str, list[str]], detected: dict[str, str], cur: dict[str, str], prov: dict[str, str], ceph: Assessment, openstack: Assessment) -> dict[str, Any]:
     return {
         "reporter_version": TOOL_VERSION,
@@ -1053,21 +1662,34 @@ def main() -> int:
     md_path = outdir / "environment-report.md"
     json_path = outdir / "environment-data.json"
     pdf_path = outdir / "environment-report.pdf"
+    hw_html_path = outdir / "hardware-report.html"
+    hw_md_path = outdir / "hardware-report.md"
+    hw_pdf_path = outdir / "hardware-report.pdf"
+
     html_path.write_text(render_html(env, components, detected, cur, prov, ceph, openstack), encoding="utf-8")
     md_path.write_text(render_markdown(env, components, detected, cur, prov, ceph, openstack), encoding="utf-8")
+    hw_html_path.write_text(render_hardware_html(env, components), encoding="utf-8")
+    hw_md_path.write_text(render_hardware_markdown(env, components), encoding="utf-8")
     json_path.write_text(json.dumps(as_jsonable(env, components, detected, cur, prov, ceph, openstack), indent=2), encoding="utf-8")
     pdf_ok = False if args.no_pdf else render_pdf(pdf_path, env, components, detected, cur, prov, ceph, openstack)
+    hw_pdf_ok = False if args.no_pdf else render_hardware_pdf(hw_pdf_path, env, components)
 
     print(f"Parsed nodes: {len(env.nodes)}")
     print(f"Ceph:      {ceph.verdict} ({ceph.score}/100)")
     print(f"OpenStack: {openstack.verdict} ({openstack.score}/100)")
-    print(f"HTML: {html_path}")
-    print(f"Markdown: {md_path}")
+    print(f"Readiness HTML: {html_path}")
+    print(f"Readiness Markdown: {md_path}")
+    print(f"Hardware HTML: {hw_html_path}")
+    print(f"Hardware Markdown: {hw_md_path}")
     print(f"JSON: {json_path}")
     if pdf_ok:
-        print(f"PDF: {pdf_path}")
+        print(f"Readiness PDF: {pdf_path}")
     elif not args.no_pdf:
-        print("PDF: not generated (install reportlab: python -m pip install reportlab)")
+        print("Readiness PDF: not generated (install reportlab: python -m pip install reportlab)")
+    if hw_pdf_ok:
+        print(f"Hardware PDF: {hw_pdf_path}")
+    elif not args.no_pdf:
+        print("Hardware PDF: not generated (install reportlab: python -m pip install reportlab)")
     return 1 if ceph.blockers or openstack.blockers else 0
 
 
